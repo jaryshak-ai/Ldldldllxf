@@ -1,0 +1,387 @@
+# ==========================================================
+# Eclips | WorldLimit | ВСЁ В ОДНОМ ФАЙЛЕ
+# Положить в: .github/workflows/worldlimit.yml
+# Workflow сам создаёт pom.xml, plugin.yml, config.yml и исходник,
+# затем компилирует. Готовый .jar: Actions -> Artifacts,
+# либо Releases -> WorldLimit latest
+# ==========================================================
+name: Build WorldLimit
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Generate project files
+        run: |
+          mkdir -p "$(dirname 'pom.xml')"
+          cat > 'pom.xml' << 'ECLIPS_EOF_0'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+
+              <groupId>ru.eclips</groupId>
+              <artifactId>WorldLimit</artifactId>
+              <version>1.0.0</version>
+              <packaging>jar</packaging>
+
+              <properties>
+                  <maven.compiler.source>17</maven.compiler.source>
+                  <maven.compiler.target>17</maven.compiler.target>
+                  <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+
+              <repositories>
+                  <repository>
+                      <id>lanink</id>
+                      <url>https://repo.lanink.cn/repository/maven-public/</url>
+                  </repository>
+              </repositories>
+
+              <dependencies>
+                  <dependency>
+                      <groupId>cn.nukkit</groupId>
+                      <artifactId>Nukkit</artifactId>
+                      <version>MOT-SNAPSHOT</version>
+                      <scope>provided</scope>
+                  </dependency>
+              </dependencies>
+
+              <build>
+                  <finalName>WorldLimit</finalName>
+                  <resources>
+                      <resource>
+                          <directory>src/main/resources</directory>
+                          <filtering>true</filtering>
+                      </resource>
+                  </resources>
+              </build>
+          </project>
+          ECLIPS_EOF_0
+
+          mkdir -p "$(dirname 'src/main/resources/plugin.yml')"
+          cat > 'src/main/resources/plugin.yml' << 'ECLIPS_EOF_1'
+          name: WorldLimit
+          main: ru.eclips.worldlimit.WorldLimit
+          version: "${project.version}"
+          api: ["1.0.0"]
+          author: Eclips
+          description: Граница мира по координатам и высоте
+
+          commands:
+            wlimit:
+              description: Управление границей мира
+              usage: /wlimit reload
+              permission: worldlimit.admin
+
+          permissions:
+            worldlimit.admin:
+              description: Доступ к /wlimit
+              default: op
+            worldlimit.bypass:
+              description: Обход границы мира
+              default: op
+          ECLIPS_EOF_1
+
+          mkdir -p "$(dirname 'src/main/resources/config.yml')"
+          cat > 'src/main/resources/config.yml' << 'ECLIPS_EOF_2'
+          # Миры, где действует граница (названия папок миров).
+          # Пустой список [] = все миры.
+          worlds: []
+
+          # Мягкая граница: дальше нельзя пройти, игрока возвращает назад,
+          # телепорт дальше блокируется.
+          limit:
+            max-xz: 5000
+            max-y: 1000
+
+          # Жёсткая граница: если игрок как-то оказался дальше, его мгновенно
+          # переносит на безопасную точку.
+          hard-limit:
+            max-xz: 6000
+            max-y: 1500
+            safe-x: 100
+            safe-y: 100
+            safe-z: 100
+            # Мир безопасной точки. Пусто = тот же мир, где находится игрок.
+            safe-world: ""
+
+          messages:
+            border: "&cВы достигли границы мира! Лимит: &f{xz}&c блоков по X/Z и &f{y}&c по высоте."
+            teleport: "&cТак далеко телепортироваться нельзя! Лимит: &f{xz}&c блоков по X/Z и &f{y}&c по высоте."
+            hard: "&cВы были слишком далеко и возвращены на безопасную точку."
+          ECLIPS_EOF_2
+
+          mkdir -p "$(dirname 'src/main/java/ru/eclips/worldlimit/WorldLimit.java')"
+          cat > 'src/main/java/ru/eclips/worldlimit/WorldLimit.java' << 'ECLIPS_EOF_3'
+          package ru.eclips.worldlimit;
+
+          import cn.nukkit.Player;
+          import cn.nukkit.command.Command;
+          import cn.nukkit.command.CommandSender;
+          import cn.nukkit.event.EventHandler;
+          import cn.nukkit.event.EventPriority;
+          import cn.nukkit.event.Listener;
+          import cn.nukkit.event.player.PlayerJoinEvent;
+          import cn.nukkit.event.player.PlayerMoveEvent;
+          import cn.nukkit.event.player.PlayerQuitEvent;
+          import cn.nukkit.event.player.PlayerTeleportEvent;
+          import cn.nukkit.level.Level;
+          import cn.nukkit.level.Location;
+          import cn.nukkit.plugin.PluginBase;
+          import cn.nukkit.scheduler.TaskHandler;
+
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Map;
+          import java.util.Set;
+          import java.util.UUID;
+
+          public class WorldLimit extends PluginBase implements Listener {
+
+              private static final String BYPASS = "worldlimit.bypass";
+              private static final long NOTIFY_COOLDOWN_MS = 2000L;
+
+              private double softXz;
+              private double softY;
+              private double hardXz;
+              private double hardY;
+              private double safeX;
+              private double safeY;
+              private double safeZ;
+              private String safeWorld = "";
+              private final Set<String> worlds = new HashSet<>();
+              private String msgBorder = "";
+              private String msgTeleport = "";
+              private String msgHard = "";
+
+              private final Map<UUID, Long> lastNotify = new HashMap<>();
+              private TaskHandler checker;
+
+              @Override
+              public void onEnable() {
+                  saveDefaultConfig();
+                  load();
+                  getServer().getPluginManager().registerEvents(this, this);
+                  getLogger().info("WorldLimit включён. Граница: " + (int) softXz + " XZ / " + (int) softY
+                          + " Y, жёсткая: " + (int) hardXz + " XZ / " + (int) hardY + " Y");
+              }
+
+              @Override
+              public void onDisable() {
+                  if (checker != null) {
+                      checker.cancel();
+                      checker = null;
+                  }
+              }
+
+              private void load() {
+                  reloadConfig();
+
+                  softXz = getConfig().getDouble("limit.max-xz", 5000);
+                  softY = getConfig().getDouble("limit.max-y", 1000);
+                  hardXz = Math.max(softXz, getConfig().getDouble("hard-limit.max-xz", 6000));
+                  hardY = Math.max(softY, getConfig().getDouble("hard-limit.max-y", 1500));
+                  safeX = getConfig().getDouble("hard-limit.safe-x", 100);
+                  safeY = getConfig().getDouble("hard-limit.safe-y", 100);
+                  safeZ = getConfig().getDouble("hard-limit.safe-z", 100);
+                  safeWorld = getConfig().getString("hard-limit.safe-world", "");
+                  if (safeWorld == null) safeWorld = "";
+
+                  worlds.clear();
+                  for (String w : getConfig().getStringList("worlds")) {
+                      if (w != null && !w.isBlank()) worlds.add(w.toLowerCase());
+                  }
+
+                  msgBorder = color(getConfig().getString("messages.border", ""));
+                  msgTeleport = color(getConfig().getString("messages.teleport", ""));
+                  msgHard = color(getConfig().getString("messages.hard", ""));
+
+                  if (beyondSoft(safeX, safeY, safeZ)) {
+                      getLogger().warning("Безопасная точка находится за границей! Исправь hard-limit.safe-* в config.yml");
+                  }
+
+                  if (checker != null) checker.cancel();
+                  checker = getServer().getScheduler().scheduleRepeatingTask(this, this::checkAll, 10);
+              }
+
+              // ---------- проверки ----------
+
+              private boolean tracked(Level level) {
+                  return level != null && (worlds.isEmpty() || worlds.contains(level.getName().toLowerCase()));
+              }
+
+              private boolean beyondSoft(double x, double y, double z) {
+                  return Math.abs(x) > softXz || Math.abs(z) > softXz || y > softY;
+              }
+
+              private boolean beyondHard(double x, double y, double z) {
+                  return Math.abs(x) > hardXz || Math.abs(z) > hardXz || y > hardY;
+              }
+
+              private static double clamp(double v, double lim) {
+                  return Math.max(-lim, Math.min(lim, v));
+              }
+
+              private static String color(String s) {
+                  return s == null ? "" : s.replace('&', '\u00A7');
+              }
+
+              private String fmt(String s) {
+                  return s.replace("{xz}", String.valueOf((int) softXz)).replace("{y}", String.valueOf((int) softY));
+              }
+
+              private void notifyPlayer(Player p, String msg) {
+                  long now = System.currentTimeMillis();
+                  Long last = lastNotify.get(p.getUniqueId());
+                  if (last != null && now - last < NOTIFY_COOLDOWN_MS) return;
+                  lastNotify.put(p.getUniqueId(), now);
+                  p.sendMessage(fmt(msg));
+              }
+
+              // ---------- принудительное возвращение ----------
+
+              private void checkAll() {
+                  for (Player p : getServer().getOnlinePlayers().values()) {
+                      enforce(p);
+                  }
+              }
+
+              private void enforce(Player p) {
+                  if (p == null || !p.isOnline() || p.getLevel() == null) return;
+                  if (!tracked(p.getLevel()) || p.hasPermission(BYPASS)) return;
+
+                  Location l = p.getLocation();
+                  if (beyondHard(l.x, l.y, l.z)) {
+                      Level target = l.getLevel();
+                      if (!safeWorld.isEmpty()) {
+                          Level w = getServer().getLevelByName(safeWorld);
+                          if (w != null) target = w;
+                      }
+                      p.teleport(new Location(safeX, safeY, safeZ, l.yaw, l.pitch, target));
+                      p.resetFallDistance();
+                      p.sendMessage(fmt(msgHard));
+                  } else if (beyondSoft(l.x, l.y, l.z)) {
+                      double x = clamp(l.x, softXz - 2);
+                      double z = clamp(l.z, softXz - 2);
+                      double y = Math.min(l.y, softY - 2);
+                      p.teleport(new Location(x, y, z, l.yaw, l.pitch, l.getLevel()));
+                      p.resetFallDistance();
+                      notifyPlayer(p, msgBorder);
+                  }
+              }
+
+              private void enforceNextTick(Player p) {
+                  getServer().getScheduler().scheduleDelayedTask(this, () -> enforce(p), 1);
+              }
+
+              // ---------- события ----------
+
+              @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+              public void onMove(PlayerMoveEvent e) {
+                  Player p = e.getPlayer();
+                  Location from = e.getFrom();
+                  Location to = e.getTo();
+                  if (from == null || to == null) return;
+                  if (!tracked(to.getLevel()) || p.hasPermission(BYPASS)) return;
+
+                  if (beyondHard(to.x, to.y, to.z)) {
+                      e.setCancelled(true);
+                      enforceNextTick(p);
+                      return;
+                  }
+
+                  if (beyondSoft(to.x, to.y, to.z)) {
+                      if (beyondSoft(from.x, from.y, from.z)) {
+                          // игрок уже за мягкой границей: вернуть принудительно
+                          enforceNextTick(p);
+                      } else {
+                          // шаг через границу: отмена движения возвращает назад
+                          e.setCancelled(true);
+                      }
+                      notifyPlayer(p, msgBorder);
+                  }
+              }
+
+              @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+              public void onTeleport(PlayerTeleportEvent e) {
+                  Player p = e.getPlayer();
+                  Location to = e.getTo();
+                  if (to == null) return;
+                  if (!tracked(to.getLevel()) || p.hasPermission(BYPASS)) return;
+
+                  if (beyondSoft(to.x, to.y, to.z)) {
+                      e.setCancelled(true);
+                      p.sendMessage(fmt(msgTeleport));
+                  }
+              }
+
+              @EventHandler
+              public void onJoin(PlayerJoinEvent e) {
+                  Player p = e.getPlayer();
+                  getServer().getScheduler().scheduleDelayedTask(this, () -> enforce(p), 20);
+              }
+
+              @EventHandler
+              public void onQuit(PlayerQuitEvent e) {
+                  lastNotify.remove(e.getPlayer().getUniqueId());
+              }
+
+              // ---------- команда ----------
+
+              @Override
+              public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+                  if (!command.getName().equalsIgnoreCase("wlimit")) return false;
+
+                  if (!sender.hasPermission("worldlimit.admin")) {
+                      sender.sendMessage("\u00A7cУ вас нет прав.");
+                      return true;
+                  }
+
+                  if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
+                      load();
+                      sender.sendMessage("\u00A7aWorldLimit перезагружен.");
+                      return true;
+                  }
+
+                  sender.sendMessage("\u00A7eИспользование: /wlimit reload");
+                  return true;
+              }
+          }
+          ECLIPS_EOF_3
+
+      - name: Build with Maven
+        run: mvn -B -ntp clean package -DskipTests
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WorldLimit
+          path: target/WorldLimit.jar
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: worldlimit-latest
+          name: WorldLimit latest
+          prerelease: true
+          files: target/WorldLimit.jar
